@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt
 
 from .balancer import BalanceError, balance_equation
 from .chemistry import FormulaError, parse_formula
+from .reaction_heat import (
+    HeatError,
+    ReactionHeatError,
+    format_rational,
+    parse_heat,
+    solve_reaction_heat,
+)
 from .stoichiometry import (
     SUPPORTED_ELEMENTS,
     MassError,
@@ -20,8 +29,9 @@ from .stoichiometry import (
 
 app = FastAPI(
     title="Chemical Equation Balancer",
-    version="1.1.0",
-    description="按元素守恒配平化学方程式，并支持限量试剂与质量关系的化学计量计算。",
+    version="1.2.0",
+    description="按元素守恒配平化学方程式，支持限量试剂与质量关系的化学计量计算，"
+    "并可由已知反应热按 Hess 定律推导目标反应热。",
 )
 
 
@@ -65,13 +75,56 @@ class StoichiometryResponse(BaseModel):
     )
 
 
+# /reaction-heat 的约束：已知反应 1～8 个、全部反应涉及的不同物质总计最多 12 种、
+# net 系数为绝对值 1～99 的非零整数
+MAX_KNOWN_REACTIONS = 8
+MAX_NET_SPECIES = 12
+MAX_TOTAL_SPECIES = 12
+MAX_NET_COEFFICIENT = 99
+
+
+class KnownReactionHeat(BaseModel):
+    net: dict[str, StrictInt] = Field(
+        min_length=1,
+        max_length=MAX_NET_SPECIES,
+        description="物种净系数映射：化学式原文 -> 系数"
+        "（负整数 = 消耗，正整数 = 生成，绝对值 1～99）",
+    )
+    heat_kj: str = Field(
+        description="反应热（kJ），可带正负号、不含指数的有限十进制字符串"
+    )
+
+
+class TargetReaction(BaseModel):
+    net: dict[str, StrictInt] = Field(
+        min_length=1,
+        max_length=MAX_NET_SPECIES,
+        description="目标反应的物种净系数映射，约定同 known[].net",
+    )
+
+
+class ReactionHeatRequest(BaseModel):
+    known: list[KnownReactionHeat] = Field(
+        min_length=1, max_length=MAX_KNOWN_REACTIONS
+    )
+    target: TargetReaction
+
+
+class ReactionHeatResponse(BaseModel):
+    weights: list[str] = Field(
+        description="各已知反应的权重（按 known 顺序），分母为正的最简 p/q 字符串"
+    )
+    heat_kj: str = Field(description="目标反应热（kJ），分母为正的最简 p/q 字符串")
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {
         "service": "chemical-equation-balancer",
         "usage": (
             "POST /balance to balance an equation; "
-            "POST /stoichiometry for limiting reagent and masses"
+            "POST /stoichiometry for limiting reagent and masses; "
+            "POST /reaction-heat to derive a reaction heat from known reactions"
         ),
         "docs": "/docs",
     }
@@ -264,6 +317,161 @@ def stoichiometry(request: StoichiometryRequest) -> StoichiometryResponse:
             format_mass(m) for m in result.remaining_reactant_masses_g
         ],
     )
+
+
+@app.post("/reaction-heat", response_model=ReactionHeatResponse)
+def reaction_heat(request: ReactionHeatRequest) -> ReactionHeatResponse:
+    # 逐项解析 known：net 系数取值与化学式语法、heat_kj 格式（422，带字段路径）
+    parsed_known: list[dict[str, dict[str, int]]] = []
+    heats: list[Fraction] = []
+    for index, item in enumerate(request.known):
+        parsed_known.append(_parse_net(item.net, f"known[{index}].net"))
+        try:
+            heats.append(parse_heat(item.heat_kj))
+        except HeatError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_heat",
+                    "field": f"known[{index}].heat_kj",
+                    "value": item.heat_kj,
+                    "message": str(exc),
+                },
+            ) from exc
+    parsed_target = _parse_net(request.target.net, "target.net")
+
+    # 全部反应涉及的不同物质（以化学式原文计）总计不得超过 12 种
+    all_species: set[str] = set()
+    for item in request.known:
+        all_species.update(item.net)
+    all_species.update(request.target.net)
+    if len(all_species) > MAX_TOTAL_SPECIES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "too_many_species",
+                "species_count": len(all_species),
+                "max_species": MAX_TOTAL_SPECIES,
+                "message": (
+                    f"reactions involve {len(all_species)} distinct species, "
+                    f"exceeding the limit of {MAX_TOTAL_SPECIES}"
+                ),
+            },
+        )
+
+    # 逐项校验正负两侧非空与元素守恒（422，带字段路径）
+    nets = [item.net for item in request.known] + [request.target.net]
+    parsed_nets = parsed_known + [parsed_target]
+    fields = [f"known[{i}].net" for i in range(len(request.known))]
+    fields.append("target.net")
+    for net, parsed, field in zip(nets, parsed_nets, fields):
+        _check_net_reaction(net, parsed, field)
+
+    try:
+        result = solve_reaction_heat(nets[:-1], heats, request.target.net)
+    except ReactionHeatError as exc:
+        detail = {"error": exc.code, "message": str(exc)}
+        detail.update(exc.extra)
+        raise HTTPException(status_code=422, detail=detail) from exc
+
+    return ReactionHeatResponse(
+        weights=[format_rational(w) for w in result.weights],
+        heat_kj=format_rational(result.heat_kj),
+    )
+
+
+def _parse_net(net: dict[str, int], field: str) -> dict[str, dict[str, int]]:
+    """校验 net 映射的系数取值与化学式语法，返回 {物种原文: 元素计数}。"""
+    parsed: dict[str, dict[str, int]] = {}
+    for formula, coefficient in net.items():
+        if coefficient == 0 or abs(coefficient) > MAX_NET_COEFFICIENT:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_coefficient",
+                    "field": field,
+                    "formula": formula,
+                    "value": coefficient,
+                    "message": (
+                        f"coefficient for {formula!r} must be a non-zero "
+                        "integer with absolute value in 1.."
+                        f"{MAX_NET_COEFFICIENT} "
+                        "(negative = consumed, positive = produced)"
+                    ),
+                },
+            )
+        try:
+            parsed[formula] = parse_formula(formula)
+        except FormulaError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_formula",
+                    "field": field,
+                    "formula": formula,
+                    "message": str(exc),
+                },
+            ) from exc
+    return parsed
+
+
+def _check_net_reaction(
+    net: dict[str, int], parsed: dict[str, dict[str, int]], field: str
+) -> None:
+    """校验单个反应的正负两侧非空与元素守恒（422，带字段路径）。
+
+    先查两侧非空：全正或全负的 net 必然不守恒，若先查守恒则该错误不可达。
+    """
+    if all(coefficient > 0 for coefficient in net.values()):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "empty_side",
+                "field": field,
+                "side": "reactants",
+                "message": (
+                    "reaction has no consumed species "
+                    "(negative coefficients)"
+                ),
+            },
+        )
+    if all(coefficient < 0 for coefficient in net.values()):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "empty_side",
+                "field": field,
+                "side": "products",
+                "message": (
+                    "reaction has no produced species "
+                    "(positive coefficients)"
+                ),
+            },
+        )
+
+    element_changes: dict[str, int] = {}
+    for formula, coefficient in net.items():
+        for element, count in parsed[formula].items():
+            element_changes[element] = (
+                element_changes.get(element, 0) + coefficient * count
+            )
+    imbalanced = {e: n for e, n in element_changes.items() if n != 0}
+    if imbalanced:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unbalanced_reaction",
+                "field": field,
+                "element_changes": imbalanced,
+                "message": (
+                    "net reaction does not conserve elements: "
+                    + ", ".join(
+                        f"{element} {change:+d}"
+                        for element, change in imbalanced.items()
+                    )
+                ),
+            },
+        )
 
 
 def _parse_species(
