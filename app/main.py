@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt
 
 from .balancer import BalanceError, balance_equation
 from .chemistry import FormulaError, parse_formula
+from .reaction_heat import (
+    MAX_SPECIES,
+    HeatError,
+    ReactionHeatError,
+    format_rational,
+    parse_heat,
+    solve_reaction_heat,
+    validate_net,
+)
 from .stoichiometry import (
     SUPPORTED_ELEMENTS,
     MassError,
@@ -20,8 +31,9 @@ from .stoichiometry import (
 
 app = FastAPI(
     title="Chemical Equation Balancer",
-    version="1.1.0",
-    description="按元素守恒配平化学方程式，并支持限量试剂与质量关系的化学计量计算。",
+    version="1.2.0",
+    description="按元素守恒配平化学方程式，并支持限量试剂与质量关系的化学计量计算，"
+    "以及由已知反应热线性推导目标反应热（Hess 定律）。",
 )
 
 
@@ -65,13 +77,46 @@ class StoichiometryResponse(BaseModel):
     )
 
 
+class KnownReaction(BaseModel):
+    net: dict[str, StrictInt] = Field(
+        min_length=1,
+        description="物种化学式原文 → 净系数（负=消耗，正=生成，绝对值 1～99）",
+    )
+    heat_kj: str = Field(
+        description="反应热（kJ），可带正负号、不含指数的有限十进制字符串"
+    )
+
+
+class TargetReaction(BaseModel):
+    net: dict[str, StrictInt] = Field(
+        min_length=1,
+        description="目标反应的 net 映射，格式同 known 项",
+    )
+
+
+class ReactionHeatRequest(BaseModel):
+    known: list[KnownReaction] = Field(min_length=1, max_length=8)
+    target: TargetReaction
+
+
+class ReactionHeatResponse(BaseModel):
+    weights: list[str] = Field(
+        description="组合权重（与 known 同序），分母为正的最简 p/q 字符串"
+    )
+    target_heat_kj: str = Field(
+        description="目标反应热（kJ），分母为正的最简 p/q 字符串"
+    )
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {
         "service": "chemical-equation-balancer",
         "usage": (
             "POST /balance to balance an equation; "
-            "POST /stoichiometry for limiting reagent and masses"
+            "POST /stoichiometry for limiting reagent and masses; "
+            "POST /reaction-heat to derive a target reaction heat "
+            "from known reactions"
         ),
         "docs": "/docs",
     }
@@ -264,6 +309,83 @@ def stoichiometry(request: StoichiometryRequest) -> StoichiometryResponse:
             format_mass(m) for m in result.remaining_reactant_masses_g
         ],
     )
+
+
+@app.post("/reaction-heat", response_model=ReactionHeatResponse)
+def reaction_heat(request: ReactionHeatRequest) -> ReactionHeatResponse:
+    known_nets: list[dict[str, int]] = []
+    heats_kj: list[Fraction] = []
+    species_seen: set[str] = set()
+
+    def check_species_budget(net: dict[str, int], field: str) -> None:
+        species_seen.update(net)
+        if len(species_seen) > MAX_SPECIES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "too_many_species",
+                    "field": field,
+                    "species_total": len(species_seen),
+                    "max_species": MAX_SPECIES,
+                    "message": (
+                        f"the request involves {len(species_seen)} distinct "
+                        f"species, exceeding the limit of {MAX_SPECIES}"
+                    ),
+                },
+            )
+
+    # 逐项校验已知反应：net 语义、heat_kj 格式、物种总数预算（422 带字段路径）
+    for index, item in enumerate(request.known):
+        net_field = f"known[{index}].net"
+        try:
+            validate_net(item.net)
+        except ReactionHeatError as exc:
+            raise _reaction_heat_http_error(net_field, exc) from exc
+        try:
+            heats_kj.append(parse_heat(item.heat_kj))
+        except HeatError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_heat",
+                    "field": f"known[{index}].heat_kj",
+                    "value": item.heat_kj,
+                    "message": str(exc),
+                },
+            ) from exc
+        known_nets.append(item.net)
+        check_species_budget(item.net, net_field)
+
+    # 目标反应做同样的 net 校验与物种预算检查
+    try:
+        validate_net(request.target.net)
+    except ReactionHeatError as exc:
+        raise _reaction_heat_http_error("target.net", exc) from exc
+    check_species_budget(request.target.net, "target.net")
+
+    # 精确有理数推导：先查已知数据自相矛盾，再查目标可推导性（均为 422）
+    try:
+        weights, target_heat = solve_reaction_heat(
+            known_nets, heats_kj, request.target.net
+        )
+    except ReactionHeatError as exc:
+        detail = {"error": exc.code, "message": str(exc)}
+        detail.update(exc.extra)
+        raise HTTPException(status_code=422, detail=detail) from exc
+
+    return ReactionHeatResponse(
+        weights=[format_rational(w) for w in weights],
+        target_heat_kj=format_rational(target_heat),
+    )
+
+
+def _reaction_heat_http_error(
+    field: str, exc: ReactionHeatError
+) -> HTTPException:
+    """把 net 校验错误包装成带字段路径的 422。"""
+    detail = {"error": exc.code, "field": field, "message": str(exc)}
+    detail.update(exc.extra)
+    return HTTPException(status_code=422, detail=detail)
 
 
 def _parse_species(

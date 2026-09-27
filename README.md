@@ -2,7 +2,8 @@
 
 基于 FastAPI + SymPy 的化学方程式配平与化学计量服务。按元素守恒建立齐次线性方程组，
 用有理数精确求解零空间，得到唯一比例的严格正整数系数（约去公因子后返回）；
-`/stoichiometry` 在此基础上用 `Decimal`/精确分数完成限量试剂与质量关系计算。
+`/stoichiometry` 在此基础上用 `Decimal`/精确分数完成限量试剂与质量关系计算；
+`/reaction-heat` 用精确有理数线性代数按 Hess 定律由已知反应热推导目标反应热。
 
 ## 运行
 
@@ -29,6 +30,7 @@ docker run --rm -p 8000:8000 chemistry-api
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - 配平接口：`POST http://localhost:8000/balance`
 - 化学计量接口：`POST http://localhost:8000/stoichiometry`
+- 反应热推导接口：`POST http://localhost:8000/reaction-heat`
 
 服务完全自包含，不依赖任何外部服务。
 
@@ -100,6 +102,47 @@ curl -X POST http://localhost:8000/stoichiometry \
 | 元素 | H | C | N | O | S | Cl | Na | K | Ca | P |
 | ---- | ------ | ------ | ------ | ------ | ----- | ----- | ----- | ------ | ------ | ------ |
 | 原子量 | 1.008 | 12.011 | 14.007 | 15.999 | 32.06 | 35.45 | 22.99 | 39.098 | 40.078 | 30.974 |
+
+### POST /reaction-heat
+
+按 Hess 定律用已知反应热推导目标反应热：把每个已知反应看作物种空间中的
+向量，求目标反应的线性组合权重，目标反应热即各已知反应热的同权组合。
+全程使用 `fractions.Fraction` 精确有理数运算，结果无浮点误差。
+
+请求字段：
+
+| 字段             | 类型              | 说明                                                                 |
+| ---------------- | ----------------- | -------------------------------------------------------------------- |
+| `known`          | object[1..8]      | 已知反应数组，每项含 `net` 与 `heat_kj`                               |
+| `known[].net`    | object            | 化学式原文 → 净系数（**负整数 = 消耗，正整数 = 生成**，绝对值 1～99） |
+| `known[].heat_kj`| string            | 反应热（kJ），可带正负号、不含指数的有限十进制字符串                  |
+| `target.net`     | object            | 目标反应的 net 映射，格式同上                                         |
+
+约束：每个 net 的正负两侧都至少有一种物质，且逐元素守恒；全请求（known +
+target）涉及的不同物种总计不超过 **12** 种。
+
+```bash
+# 2C + O2 -> 2CO 的反应热 = 2×(-393.5) - (-566) = -221 kJ
+curl -X POST http://localhost:8000/reaction-heat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "known": [
+      {"net": {"C": -1, "O2": -1, "CO2": 1}, "heat_kj": "-393.5"},
+      {"net": {"CO": -2, "O2": -1, "CO2": 2}, "heat_kj": "-566"}
+    ],
+    "target": {"net": {"C": -2, "O2": -1, "CO": 2}}
+  }'
+```
+
+成功响应（200）。`weights` 与 `known` 同序（允许负数和零，不唯一时任取
+一组合法解），所有数值统一为**分母为正的最简 p/q 字符串**：
+
+```json
+{
+  "weights": ["2/1", "-1/1"],
+  "target_heat_kj": "-221/1"
+}
+```
 
 ### 化学式语法
 
@@ -179,6 +222,35 @@ curl -X POST http://localhost:8000/stoichiometry \
 | `non_unique_solution`  | 系数比例不唯一（零空间维数 > 1）   |
 | `no_positive_solution` | 不存在严格为正的系数组合           |
 
+**`/reaction-heat` 输入校验（422，带字段路径）**——`detail.field` 形如
+`known[0].net`、`known[0].heat_kj`、`target.net`：
+
+| error                 | 定位信息                          | 含义                                       |
+| --------------------- | --------------------------------- | ------------------------------------------ |
+| `invalid_coefficient` | `field` + `species`、`value`      | 净系数为零或绝对值超过 99                  |
+| `invalid_formula`     | `field` + `species`               | 物种键不是合法化学式                       |
+| `invalid_heat`        | `field` + `value`                 | `heat_kj` 不是可带符号的有限十进制字符串   |
+| `empty_side`          | `field` + `missing_side`          | net 缺少消耗侧（负系数）或生成侧（正系数） |
+| `unbalanced_reaction` | `field` + `imbalance`             | net 不满足元素守恒（附各元素净原子变化）   |
+| `too_many_species`    | `field` + `species_total` 等      | 全请求不同物种超过 12 种                   |
+
+**已知数据自相矛盾（422）**——存在净物质变化为零但热量非零的已知反应组合
+（违反 Hess 定律），返回该组合的 `weights` 与 `heat_kj`（p/q 字符串）：
+
+```json
+{
+  "detail": {
+    "error": "inconsistent_known",
+    "message": "a linear combination of the known reactions has zero net species change but non-zero heat; the known data is self-contradictory",
+    "weights": ["-2/1", "1/1"],
+    "heat_kj": "716/5"
+  }
+}
+```
+
+**目标不可推导（422）**——`not_derivable`：目标反应不在已知反应的张成
+空间内（例如引入了已知反应从未涉及的物种）。
+
 请求结构不合法（数组为空、超过 4 个式子、字段类型错误、布尔值/浮点混入
 整数字段等）由 Pydantic 返回 422，`detail[].loc` 定位到具体字段与下标。
 
@@ -186,13 +258,15 @@ curl -X POST http://localhost:8000/stoichiometry \
 
 ```
 app/
-  main.py            # FastAPI 应用与 /balance、/stoichiometry 接口
+  main.py            # FastAPI 应用与 /balance、/stoichiometry、/reaction-heat 接口
   chemistry.py       # 化学式解析（元素、下标、嵌套圆括号）
   balancer.py        # 基于 SymPy 零空间的配平算法
   stoichiometry.py   # 原子量、Decimal 摩尔质量、限量试剂与质量计算
+  reaction_heat.py   # Hess 定律反应热推导（精确有理数线性代数）
 tests/
   test_balance.py
   test_stoichiometry.py
+  test_reaction_heat.py
 Dockerfile           # 暴露 8000，含 HEALTHCHECK
 docker-compose.yml   # 端口映射 8000:8000，含 healthcheck
 requirements.txt
